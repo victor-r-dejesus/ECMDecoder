@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 import ECMCore
 import UniformTypeIdentifiers
 
@@ -73,11 +74,19 @@ struct ContentView: View {
     private func handleDrop(_ providers: [NSItemProvider]) -> Bool {
         guard !isDecoding, let provider = providers.first else { return false }
         provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
-            guard let data = item as? Data,
-                  let url = URL(dataRepresentation: data, relativeTo: nil),
-                  url.pathExtension.lowercased() == "ecm"
-            else { return }
+            let droppedURL: URL?
+            if let data = item as? Data {
+                droppedURL = URL(dataRepresentation: data, relativeTo: nil)
+            } else {
+                droppedURL = item as? URL
+            }
+            guard let url = droppedURL else { return }
+            guard url.pathExtension.lowercased() == "ecm" else {
+                logLine("Not an .ecm file: \(url.lastPathComponent)")
+                return
+            }
             DispatchQueue.main.async {
+                guard !self.isDecoding else { return }
                 self.inputFile = url
                 self.log = "Loaded: \(url.lastPathComponent)\n"
             }
@@ -197,22 +206,25 @@ struct ContentView: View {
             defer { try? handle.close() }
 
             let size = try handle.seekToEnd()
-            guard size > 0, size % 2352 == 0 else {
-                logLine("CUE skipped: output size is not a multiple of 2352 bytes")
-                return
-            }
             try handle.seek(toOffset: 0)
-            guard let head = try handle.read(upToCount: 16), head.count == 16 else {
-                logLine("CUE skipped: could not read first sector")
-                return
-            }
+            let head = [UInt8](try handle.read(upToCount: 16) ?? Data())
+            let syncPattern: [UInt8] = [0x00] + [UInt8](repeating: 0xFF, count: 10) + [0x00]
 
             let trackMode: String
-            switch head[head.startIndex + 0x0F] {
-            case 1: trackMode = "MODE1/2352"
-            case 2: trackMode = "MODE2/2352"
-            default:
-                logLine("CUE skipped: unrecognized sector mode")
+            if size > 0, size % 2352 == 0, head.count == 16, Array(head[0..<12]) == syncPattern {
+                // Raw 2352-byte sectors: the mode byte follows the sync and address
+                switch head[0x0F] {
+                case 1: trackMode = "MODE1/2352"
+                case 2: trackMode = "MODE2/2352"
+                default:
+                    logLine("CUE skipped: unrecognized sector mode")
+                    return
+                }
+            } else if size > 0, size % 2336 == 0, head.count == 16, Array(head[0..<4]) == Array(head[4..<8]) {
+                // Headerless mode 2 sectors (ECM types 2/3 without raw sync/header bytes)
+                trackMode = "MODE2/2336"
+            } else {
+                logLine("CUE skipped: output is not a raw 2352- or 2336-byte sector image")
                 return
             }
 
