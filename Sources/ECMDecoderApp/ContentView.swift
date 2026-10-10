@@ -1,4 +1,5 @@
 import SwiftUI
+import ECMCore
 import UniformTypeIdentifiers
 
 struct ContentView: View {
@@ -6,7 +7,7 @@ struct ContentView: View {
     @State private var log: String = ""
     @State private var isDecoding = false
     @State private var generateCue = true
-    @State private var cancelRequested = false
+    @State private var cancelFlag = CancelFlag()
     @State private var progress: Double = 0
     @State private var eta: String = "--:--"
 
@@ -29,6 +30,9 @@ struct ContentView: View {
             .onDrop(of: [.fileURL], isTargeted: nil) { providers in
                 handleDrop(providers)
             }
+
+            Button("Choose File…") { chooseFile() }
+                .disabled(isDecoding)
 
             Toggle("Generate .cue file", isOn: $generateCue)
 
@@ -67,7 +71,7 @@ struct ContentView: View {
 
     // MARK: - Drag Handling
     private func handleDrop(_ providers: [NSItemProvider]) -> Bool {
-        guard let provider = providers.first else { return false }
+        guard !isDecoding, let provider = providers.first else { return false }
         provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
             guard let data = item as? Data,
                   let url = URL(dataRepresentation: data, relativeTo: nil),
@@ -79,6 +83,20 @@ struct ContentView: View {
             }
         }
         return true
+    }
+
+    private func chooseFile() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        if let ecmType = UTType(filenameExtension: "ecm") {
+            panel.allowedContentTypes = [ecmType]
+        }
+        panel.prompt = "Choose"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        inputFile = url
+        log = "Loaded: \(url.lastPathComponent)\n"
     }
 
     private func clearInput() {
@@ -100,10 +118,13 @@ struct ContentView: View {
         guard panel.runModal() == .OK, let outputDir = panel.url else { return }
 
         isDecoding = true
-        cancelRequested = false
+        let flag = CancelFlag()
+        cancelFlag = flag
         progress = 0
         eta = "--:--"
         logLine("Starting decode...")
+
+        let wantsCue = generateCue
 
         DispatchQueue.global(qos: .userInitiated).async {
             let startTime = Date()
@@ -115,6 +136,7 @@ struct ContentView: View {
                     inputURL: input,
                     outputURL: binURL,
                     progressHandler: { prog in
+                        guard prog.totalBytes > 0 else { return }
                         DispatchQueue.main.async {
                             // Clamp progress to 1.0 max
                             let value = min(Double(prog.bytesProcessed) / Double(prog.totalBytes), 1.0)
@@ -127,24 +149,29 @@ struct ContentView: View {
                             eta = formatTime(remaining)
                         }
                     },
-                    cancelCheck: { self.cancelRequested }
+                    cancelCheck: { flag.isSet }
                 )
+
+                if wantsCue {
+                    createCue(for: binURL, in: outputDir, baseName: baseName)
+                }
 
                 DispatchQueue.main.async {
                     // Ensure 100% at completion
                     progress = 1.0
                     eta = "00:00"
-                    logLine("✅ Decoding completed: \(binURL.lastPathComponent)")
-
-                    if generateCue {
-                        createCue(in: outputDir, baseName: baseName)
-                    }
-
+                    logLine("Decoding completed: \(binURL.lastPathComponent)")
                     resetUI()
                 }
             } catch {
                 DispatchQueue.main.async {
-                    logLine("❌ Decoding failed: \(error.localizedDescription)")
+                    if let ecmError = error as? ECMError, ecmError == .canceled {
+                        logLine("Decoding canceled.")
+                    } else {
+                        logLine("Decoding failed: \(error.localizedDescription)")
+                    }
+                    progress = 0
+                    eta = "--:--"
                     isDecoding = false
                 }
             }
@@ -152,7 +179,7 @@ struct ContentView: View {
     }
 
     private func cancelDecoding() {
-        cancelRequested = true
+        cancelFlag.set()
         logLine("Cancel requested...")
     }
 
@@ -162,40 +189,49 @@ struct ContentView: View {
     }
 
     // MARK: - Cue Generation
-    private func createCue(in directory: URL, baseName: String) {
+    /// Writes a single-track cue sheet for the decoded .bin only.
+    /// Runs off the main thread (reads the output file); logs via logLine.
+    private func createCue(for binURL: URL, in directory: URL, baseName: String) {
         do {
-            let binFiles = try validatedBinFiles(in: directory)
-            let cueText = generateCueSheet(from: binFiles)
+            let handle = try FileHandle(forReadingFrom: binURL)
+            defer { try? handle.close() }
+
+            let size = try handle.seekToEnd()
+            guard size > 0, size % 2352 == 0 else {
+                logLine("CUE skipped: output size is not a multiple of 2352 bytes")
+                return
+            }
+            try handle.seek(toOffset: 0)
+            guard let head = try handle.read(upToCount: 16), head.count == 16 else {
+                logLine("CUE skipped: could not read first sector")
+                return
+            }
+
+            let trackMode: String
+            switch head[head.startIndex + 0x0F] {
+            case 1: trackMode = "MODE1/2352"
+            case 2: trackMode = "MODE2/2352"
+            default:
+                logLine("CUE skipped: unrecognized sector mode")
+                return
+            }
+
+            let cueText = generateCueSheet(binName: binURL.lastPathComponent, trackMode: trackMode)
             let cueURL = directory.appendingPathComponent(baseName).appendingPathExtension("cue")
             try cueText.write(to: cueURL, atomically: true, encoding: .utf8)
-            logLine("CUE created: \(cueURL.lastPathComponent)")
+            logLine("CUE created: \(cueURL.lastPathComponent) (\(trackMode))")
         } catch {
             logLine("CUE skipped: \(error.localizedDescription)")
         }
     }
 
-    private func validatedBinFiles(in directory: URL) throws -> [String] {
-        let files = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
-        let bins = files.filter { $0.pathExtension.lowercased() == "bin" }
-                        .sorted { $0.lastPathComponent < $1.lastPathComponent }
-                        .map { $0.lastPathComponent }
-        guard !bins.isEmpty else { throw CueError.noBinFiles }
-        logLine("Found \(bins.count) .bin file(s)")
-        return bins
-    }
-
-    private func generateCueSheet(from files: [String]) -> String {
+    private func generateCueSheet(binName: String, trackMode: String) -> String {
+        // Cue sheets have no escape for quotes, so replace them
+        let safeName = binName.replacingOccurrences(of: "\"", with: "'")
         var lines: [String] = []
-        lines.append("FILE \"\(files[0])\" BINARY")
-        lines.append("  TRACK 01 MODE2/2352")
+        lines.append("FILE \"\(safeName)\" BINARY")
+        lines.append("  TRACK 01 \(trackMode)")
         lines.append("    INDEX 01 00:00:00")
-        for (index, file) in files.dropFirst().enumerated() {
-            let track = index + 2
-            lines.append("FILE \"\(file)\" BINARY")
-            lines.append("  TRACK \(String(format: "%02d", track)) AUDIO")
-            lines.append("   INDEX 00 00:00:00")
-            lines.append("   INDEX 01 00:02:00")
-        }
         return lines.joined(separator: "\n") + "\n"
     }
 
@@ -220,12 +256,21 @@ struct ContentView: View {
     }
 }
 
-// MARK: - Errors
-enum CueError: LocalizedError {
-    case noBinFiles
-    var errorDescription: String? {
-        switch self {
-        case .noBinFiles: return "No .bin files found in output directory"
-        }
+// MARK: - Cancellation
+/// Thread-safe cancellation flag shared between the UI and the decoding thread.
+final class CancelFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = false
+
+    var isSet: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
+
+    func set() {
+        lock.lock()
+        value = true
+        lock.unlock()
     }
 }

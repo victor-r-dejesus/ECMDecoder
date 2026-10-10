@@ -24,8 +24,13 @@ struct ECCEDC {
     }
 
     func edcPartialComputeBlock(edc: ECCUInt32, src: UnsafePointer<ECCUInt8>, size: ECCUInt16) -> ECCUInt32 {
+        return edcUpdate(edc, src, count: Int(size))
+    }
+
+    /// Continues an EDC computation over `count` bytes (no 16-bit size limit).
+    func edcUpdate(_ edc: ECCUInt32, _ src: UnsafePointer<ECCUInt8>, count: Int) -> ECCUInt32 {
         var edc = edc
-        for i in 0..<Int(size) {
+        for i in 0..<count {
             edc = (edc >> 8) ^ edcLUT[Int((edc ^ ECCUInt32(src[i])) & 0xFF)]
         }
         return edc
@@ -33,13 +38,17 @@ struct ECCEDC {
 
     func edcComputeBlock(src: UnsafePointer<ECCUInt8>, size: ECCUInt16, dest: UnsafeMutablePointer<ECCUInt8>) {
         let edc = edcPartialComputeBlock(edc: 0, src: src, size: size)
-        dest[0] = ECCUInt8((edc >> 0) & 0xFF)
-        dest[1] = ECCUInt8((edc >> 8) & 0xFF)
-        dest[2] = ECCUInt8((edc >> 16) & 0xFF)
-        dest[3] = ECCUInt8((edc >> 24) & 0xFF)
+        putLE32(edc, to: dest)
     }
 
-    private func eccComputeBlock(src: UnsafeMutablePointer<ECCUInt8>,
+    private func putLE32(_ value: ECCUInt32, to dest: UnsafeMutablePointer<ECCUInt8>) {
+        dest[0] = ECCUInt8((value >> 0) & 0xFF)
+        dest[1] = ECCUInt8((value >> 8) & 0xFF)
+        dest[2] = ECCUInt8((value >> 16) & 0xFF)
+        dest[3] = ECCUInt8((value >> 24) & 0xFF)
+    }
+
+    private func eccComputeBlock(src: UnsafePointer<ECCUInt8>,
                                  majorCount: ECCUInt32,
                                  minorCount: ECCUInt32,
                                  majorMult: ECCUInt32,
@@ -65,205 +74,239 @@ struct ECCEDC {
         }
     }
 
-    private func eccGenerate(sector: inout [ECCUInt8], zeroAddress: Bool) {
+    /// Generates P parity (at 0x81C) and then Q parity (at 0x8C8), in place.
+    /// Q covers the P bytes, so P must be written into the sector first.
+    private func eccGenerate(sector: UnsafeMutablePointer<ECCUInt8>, zeroAddress: Bool) {
         // Optionally zero out the address bytes, saving a copy to restore later
-        var savedAddress: [ECCUInt8] = [0, 0, 0, 0]
+        var savedAddress: (ECCUInt8, ECCUInt8, ECCUInt8, ECCUInt8) = (0, 0, 0, 0)
         if zeroAddress {
-            for i in 0..<4 {
-                savedAddress[i] = sector[12 + i]
-                sector[12 + i] = 0
-            }
+            savedAddress = (sector[12], sector[13], sector[14], sector[15])
+            sector[12] = 0
+            sector[13] = 0
+            sector[14] = 0
+            sector[15] = 0
         }
 
-        // Copy the source region to avoid overlapping inout accesses
-        // Source starts at offset 12 and covers the whole sector payload we'll read from
-        var src = Array(sector[12...])
+        // P parity: reads 0x00C..<0x81C, writes 0x81C..<0x8C8 (no overlap)
+        eccComputeBlock(src: sector + 0xC,
+                        majorCount: 86,
+                        minorCount: 24,
+                        majorMult: 2,
+                        minorInc: 86,
+                        dest: sector + 0x81C)
 
-        // Prepare local destination buffers for ECC results
-        var dest1 = [ECCUInt8](repeating: 0, count: Int(86 * 2)) // majorCount * 2
-        var dest2 = [ECCUInt8](repeating: 0, count: Int(52 * 2))
+        // Q parity: reads 0x00C..<0x8C8 (including P), writes 0x8C8..<0x930 (no overlap)
+        eccComputeBlock(src: sector + 0xC,
+                        majorCount: 52,
+                        minorCount: 43,
+                        majorMult: 86,
+                        minorInc: 88,
+                        dest: sector + 0x8C8)
 
-        // Compute ECC into local buffers
-        dest1.withUnsafeMutableBufferPointer { d1 in
-            src.withUnsafeMutableBufferPointer { s in
-                eccComputeBlock(src: s.baseAddress!,
-                                majorCount: 86,
-                                minorCount: 24,
-                                majorMult: 2,
-                                minorInc: 86,
-                                dest: d1.baseAddress!)
-            }
-        }
-
-        dest2.withUnsafeMutableBufferPointer { d2 in
-            src.withUnsafeMutableBufferPointer { s in
-                eccComputeBlock(src: s.baseAddress!,
-                                majorCount: 52,
-                                minorCount: 43,
-                                majorMult: 86,
-                                minorInc: 88,
-                                dest: d2.baseAddress!)
-            }
-        }
-
-        // Write ECC results back into the sector after computations are complete
-        for i in 0..<dest1.count {
-            sector[0x81C + i] = dest1[i]
-        }
-        for i in 0..<dest2.count {
-            sector[0x8C8 + i] = dest2[i]
-        }
-
-        // Restore address if needed
         if zeroAddress {
-            for i in 0..<4 { sector[12 + i] = savedAddress[i] }
+            sector[12] = savedAddress.0
+            sector[13] = savedAddress.1
+            sector[14] = savedAddress.2
+            sector[15] = savedAddress.3
         }
     }
 
     func eccedcGenerate(sector: inout [ECCUInt8], type: Int) {
-        switch type {
-        case 1:
-            // Compute EDC over first 0x810 bytes into a temporary buffer, then write back
-            var edcDest1 = [ECCUInt8](repeating: 0, count: 4)
-            sector.withUnsafeMutableBufferPointer { s in
-                edcDest1.withUnsafeMutableBufferPointer { d in
-                    edcComputeBlock(src: s.baseAddress!, size: 0x810, dest: d.baseAddress!)
-                }
-            }
-            // Write EDC bytes back to sector at 0x810
-            for i in 0..<4 { sector[0x810 + i] = edcDest1[i] }
-            // Zero 8 bytes at 0x814
-            for i in 0..<8 { sector[0x814 + i] = 0 }
-            // Generate ECC using a copy to avoid overlapping inout access
-            eccGenerate(sector: &sector, zeroAddress: false)
+        guard sector.count >= 2352 else { return }
+        sector.withUnsafeMutableBufferPointer { buf in
+            guard let s = buf.baseAddress else { return }
+            switch type {
+            case 1:
+                // Mode 1: EDC over the first 0x810 bytes, 8 zero bytes, then ECC
+                let edc = edcPartialComputeBlock(edc: 0, src: s, size: 0x810)
+                putLE32(edc, to: s + 0x810)
+                for i in 0..<8 { s[0x814 + i] = 0 }
+                eccGenerate(sector: s, zeroAddress: false)
 
-        case 2:
-            // Compute EDC over sector[0x10..<(0x10+0x808)] into temp, then copy back to 0x818
-            var edcDest2 = [ECCUInt8](repeating: 0, count: 4)
-            // Create a local copy of the source slice to satisfy exclusivity
-            let src2 = Array(sector[0x10..<(0x10 + 0x808)])
-            src2.withUnsafeBufferPointer { s in
-                edcDest2.withUnsafeMutableBufferPointer { d in
-                    edcComputeBlock(src: s.baseAddress!, size: 0x808, dest: d.baseAddress!)
-                }
-            }
-            for i in 0..<4 { sector[0x818 + i] = edcDest2[i] }
-            // ECC generation (internally already avoids overlapping by copying)
-            eccGenerate(sector: &sector, zeroAddress: true)
+            case 2:
+                // Mode 2 form 1: EDC over 0x10..<0x818 stored at 0x818, then ECC with zeroed address
+                edcComputeBlock(src: s + 0x10, size: 0x808, dest: s + 0x818)
+                eccGenerate(sector: s, zeroAddress: true)
 
-        case 3:
-            // Compute EDC over sector[0x10..<(0x10+0x91C)] into temp, then copy back to 0x92C
-            var edcDest3 = [ECCUInt8](repeating: 0, count: 4)
-            let src3 = Array(sector[0x10..<(0x10 + 0x91C)])
-            src3.withUnsafeBufferPointer { s in
-                edcDest3.withUnsafeMutableBufferPointer { d in
-                    edcComputeBlock(src: s.baseAddress!, size: 0x91C, dest: d.baseAddress!)
-                }
-            }
-            for i in 0..<4 { sector[0x92C + i] = edcDest3[i] }
+            case 3:
+                // Mode 2 form 2: EDC over 0x10..<0x92C stored at 0x92C, no ECC
+                edcComputeBlock(src: s + 0x10, size: 0x91C, dest: s + 0x92C)
 
-        default:
-            break
+            default:
+                break
+            }
+        }
+    }
+}
+
+// MARK: - Errors
+public enum ECMError: Error, Equatable, LocalizedError {
+    case fileTooShort
+    case invalidHeader
+    case truncatedData
+    case invalidCount
+    case checksumMismatch
+    case canceled
+
+    public var errorDescription: String? {
+        switch self {
+        case .fileTooShort: return "File too short"
+        case .invalidHeader: return "Not an ECM file (header not found)"
+        case .truncatedData: return "ECM data is truncated"
+        case .invalidCount: return "ECM data is corrupt (invalid sector count)"
+        case .checksumMismatch: return "Checksum mismatch: decoded data is corrupt"
+        case .canceled: return "Canceled"
         }
     }
 }
 
 // MARK: - ECM Decoder
-class ECMDecoder {
+public final class ECMDecoder {
     private let eccedc = ECCEDC()
 
-    struct Progress {
-        var bytesProcessed: Int
-        var totalBytes: Int
+    public struct Progress {
+        public var bytesProcessed: Int
+        public var totalBytes: Int
+
+        public init(bytesProcessed: Int, totalBytes: Int) {
+            self.bytesProcessed = bytesProcessed
+            self.totalBytes = totalBytes
+        }
     }
 
-    func decode(inputURL: URL,
-                outputURL: URL,
-                progressHandler: @escaping (Progress) -> Void,
-                cancelCheck: @escaping () -> Bool) throws {
+    public init() {}
 
+    public func decode(inputURL: URL,
+                       outputURL: URL,
+                       progressHandler: @escaping (Progress) -> Void,
+                       cancelCheck: @escaping () -> Bool) throws {
         let data = try Data(contentsOf: inputURL)
-        var output = Data()
-        var offset = 0
-        let total = data.count
+        let output = try decode(data: data, progressHandler: progressHandler, cancelCheck: cancelCheck)
+        try output.write(to: outputURL)
+    }
 
-        guard data.count > 4 else {
-            throw NSError(domain: "ECM", code: 1, userInfo: [NSLocalizedDescriptionKey: "File too short"])
+    public func decode(data: Data,
+                       progressHandler: ((Progress) -> Void)? = nil,
+                       cancelCheck: (() -> Bool)? = nil) throws -> Data {
+        return try data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> Data in
+            let input = raw.bindMemory(to: UInt8.self)
+            return try decodeBytes(input, progressHandler: progressHandler, cancelCheck: cancelCheck)
+        }
+    }
+
+    private func decodeBytes(_ input: UnsafeBufferPointer<UInt8>,
+                             progressHandler: ((Progress) -> Void)?,
+                             cancelCheck: (() -> Bool)?) throws -> Data {
+        let total = input.count
+        guard total > 4, let base = input.baseAddress else {
+            throw ECMError.fileTooShort
+        }
+        guard input[0] == 0x45, input[1] == 0x43, input[2] == 0x4D, input[3] == 0 else {
+            throw ECMError.invalidHeader
         }
 
-        guard data[offset] == 0x45, data[offset+1] == 0x43, data[offset+2] == 0x4D, data[offset+3] == 0 else {
-            throw NSError(domain: "ECM", code: 2, userInfo: [NSLocalizedDescriptionKey: "Header not found"])
-        }
-        offset += 4
+        var offset = 4
+        var output = [UInt8]()
+        output.reserveCapacity(total)
+        var edc: ECCUInt32 = 0
+        var lastReported = 0
+        let reportInterval = 1 << 20
 
-        while offset < data.count {
-            if cancelCheck() {
-                throw NSError(domain: "ECM", code: 99, userInfo: [NSLocalizedDescriptionKey: "Canceled"])
+        // Reusable sector buffer; sync pattern is constant, the rest is rewritten per sector.
+        var sector = [ECCUInt8](repeating: 0, count: 2352)
+        for i in 1..<11 { sector[i] = 0xFF }
+
+        func tick(force: Bool) throws {
+            if let cancelCheck = cancelCheck, cancelCheck() {
+                throw ECMError.canceled
             }
+            if force || offset - lastReported >= reportInterval {
+                lastReported = offset
+                progressHandler?(Progress(bytesProcessed: offset, totalBytes: total))
+            }
+        }
 
-            var c = data[offset]; offset += 1
+        while true {
+            try tick(force: false)
+
+            guard offset < total else { throw ECMError.truncatedData } // no end marker
+
+            var c = input[offset]; offset += 1
             let type = Int(c & 3)
             var num = Int((c >> 2) & 0x1F)
             var bits = 5
             while c & 0x80 != 0 {
-                guard offset < data.count else { break }
-                c = data[offset]; offset += 1
+                guard offset < total else { throw ECMError.truncatedData }
+                guard bits <= 31 else { throw ECMError.invalidCount }
+                c = input[offset]; offset += 1
                 num |= Int(c & 0x7F) << bits
                 bits += 7
             }
+            guard num <= 0xFFFFFFFF else { throw ECMError.invalidCount }
             if num == 0xFFFFFFFF { break }
             num += 1
 
             if type == 0 {
-                guard offset + num <= data.count else { break }
-                output.append(data[offset..<offset+num])
+                guard num <= total - offset else { throw ECMError.truncatedData }
+                output.append(contentsOf: UnsafeBufferPointer(rebasing: input[offset..<(offset + num)]))
+                edc = eccedc.edcUpdate(edc, base + offset, count: num)
                 offset += num
-            } else {
-                for _ in 0..<num {
-                    // Prepare sector buffer
-                    var sectorBuffer = [ECCUInt8](repeating: 0, count: 2352)
-                    for i in 1..<11 { sectorBuffer[i] = 0xFF }
-
-                    switch type {
-                    case 1:
-                        sectorBuffer[0x0F] = 0x01
-                        guard offset + 0x003 + 0x800 <= data.count else { break }
-                        sectorBuffer.replaceSubrange(0x00C..<(0x00C+0x003), with: data[offset..<(offset+0x003)])
-                        offset += 0x003
-                        sectorBuffer.replaceSubrange(0x010..<(0x010+0x800), with: data[offset..<(offset+0x800)])
-                        offset += 0x800
-
-                        eccedc.eccedcGenerate(sector: &sectorBuffer, type: 1)
-                        output.append(contentsOf: sectorBuffer) // full array
-
-                    case 2:
-                        sectorBuffer[0x0F] = 0x02
-                        guard offset + 0x804 <= data.count else { break }
-                        sectorBuffer.replaceSubrange(0x014..<(0x014+0x804), with: data[offset..<(offset+0x804)])
-                        offset += 0x804
-
-                        eccedc.eccedcGenerate(sector: &sectorBuffer, type: 2)
-                        let slice2 = Array(sectorBuffer[0x010..<(0x010+2336)])
-                        output.append(contentsOf: slice2)
-
-                    case 3:
-                        sectorBuffer[0x0F] = 0x02
-                        guard offset + 0x918 <= data.count else { break }
-                        sectorBuffer.replaceSubrange(0x014..<(0x014+0x918), with: data[offset..<(offset+0x918)])
-                        offset += 0x918
-
-                        eccedc.eccedcGenerate(sector: &sectorBuffer, type: 3)
-                        let slice3 = Array(sectorBuffer[0x010..<(0x010+2336)])
-                        output.append(contentsOf: slice3)
-
-                    default: break
-                    }
-                }
+                continue
             }
 
-            progressHandler(.init(bytesProcessed: offset, totalBytes: total))
+            // Bytes stored per sector and where they land in the sector buffer
+            let storedSize: Int
+            let destOffset: Int
+            switch type {
+            case 1: storedSize = 0x003 + 0x800; destOffset = 0x00C
+            case 2: storedSize = 0x804;         destOffset = 0x014
+            default: storedSize = 0x918;        destOffset = 0x014
+            }
+
+            for n in 0..<num {
+                if n & 0xFF == 0xFF { try tick(force: false) }
+                guard storedSize <= total - offset else { throw ECMError.truncatedData }
+
+                if type == 1 {
+                    // Mode 1: 3 address bytes at 0x0C, mode byte, 0x800 data bytes at 0x10
+                    sector.withUnsafeMutableBytes { dst in
+                        dst.baseAddress!.advanced(by: 0x00C).copyMemory(from: base + offset, byteCount: 0x003)
+                        dst.baseAddress!.advanced(by: 0x010).copyMemory(from: base + offset + 0x003, byteCount: 0x800)
+                    }
+                    sector[0x0F] = 0x01
+                } else {
+                    // Mode 2: the stored data starts at 0x14; the subheader copy at 0x10 is a duplicate
+                    sector.withUnsafeMutableBytes { dst in
+                        dst.baseAddress!.advanced(by: destOffset).copyMemory(from: base + offset, byteCount: storedSize)
+                    }
+                    sector[0x0F] = 0x02
+                    sector[0x10] = sector[0x14]
+                    sector[0x11] = sector[0x15]
+                    sector[0x12] = sector[0x16]
+                    sector[0x13] = sector[0x17]
+                }
+                offset += storedSize
+
+                eccedc.eccedcGenerate(sector: &sector, type: type)
+
+                let start = (type == 1) ? 0 : 0x10
+                let end = (type == 1) ? 2352 : 0x10 + 2336
+                sector.withUnsafeBufferPointer { b in
+                    edc = eccedc.edcUpdate(edc, b.baseAddress! + start, count: end - start)
+                }
+                output.append(contentsOf: sector[start..<end])
+            }
         }
 
-        try output.write(to: outputURL)
+        // After the end marker: 4-byte little-endian EDC of all decoded output
+        guard total - offset >= 4 else { throw ECMError.truncatedData }
+        let stored = ECCUInt32(input[offset])
+            | (ECCUInt32(input[offset + 1]) << 8)
+            | (ECCUInt32(input[offset + 2]) << 16)
+            | (ECCUInt32(input[offset + 3]) << 24)
+        guard stored == edc else { throw ECMError.checksumMismatch }
+
+        try tick(force: true)
+        return Data(output)
     }
 }
