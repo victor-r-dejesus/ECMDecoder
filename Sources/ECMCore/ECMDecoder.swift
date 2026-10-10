@@ -176,29 +176,62 @@ public final class ECMDecoder {
 
     public init() {}
 
+    /// Decodes `inputURL` into `outputURL`. The input is memory-mapped and the output is
+    /// streamed to a temporary file in the destination folder, then moved into place, so
+    /// large images do not need to fit in memory and a failed or canceled decode never
+    /// leaves a partial file behind.
     public func decode(inputURL: URL,
                        outputURL: URL,
                        progressHandler: @escaping (Progress) -> Void,
                        cancelCheck: @escaping () -> Bool) throws {
-        let data = try Data(contentsOf: inputURL)
-        let output = try decode(data: data, progressHandler: progressHandler, cancelCheck: cancelCheck)
-        try output.write(to: outputURL)
+        let data = try Data(contentsOf: inputURL, options: .mappedIfSafe)
+        let fileManager = FileManager.default
+        let tempURL = outputURL.deletingLastPathComponent()
+            .appendingPathComponent(".\(outputURL.lastPathComponent).\(UUID().uuidString).partial")
+        try Data().write(to: tempURL)
+        do {
+            let handle = try FileHandle(forWritingTo: tempURL)
+            do {
+                try data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+                    try decodeBytes(raw.bindMemory(to: UInt8.self),
+                                    progressHandler: progressHandler,
+                                    cancelCheck: cancelCheck,
+                                    sink: { chunk in try handle.write(contentsOf: chunk) })
+                }
+            } catch {
+                try? handle.close()
+                throw error
+            }
+            try handle.close()
+            if fileManager.fileExists(atPath: outputURL.path) {
+                try fileManager.removeItem(at: outputURL)
+            }
+            try fileManager.moveItem(at: tempURL, to: outputURL)
+        } catch {
+            try? fileManager.removeItem(at: tempURL)
+            throw error
+        }
     }
 
     public func decode(data: Data,
                        progressHandler: ((Progress) -> Void)? = nil,
                        cancelCheck: (() -> Bool)? = nil) throws -> Data {
-        return try data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> Data in
-            let input = raw.bindMemory(to: UInt8.self)
-            return try decodeBytes(input, progressHandler: progressHandler, cancelCheck: cancelCheck)
+        var result = Data()
+        try data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+            try decodeBytes(raw.bindMemory(to: UInt8.self),
+                            progressHandler: progressHandler,
+                            cancelCheck: cancelCheck,
+                            sink: { chunk in result.append(contentsOf: chunk) })
         }
+        return result
     }
 
     private func decodeBytes(_ input: UnsafeBufferPointer<UInt8>,
                              progressHandler: ((Progress) -> Void)?,
-                             cancelCheck: (() -> Bool)?) throws -> Data {
+                             cancelCheck: (() -> Bool)?,
+                             sink: ([UInt8]) throws -> Void) throws {
         let total = input.count
-        guard total > 4, let base = input.baseAddress else {
+        guard total >= 4, let base = input.baseAddress else {
             throw ECMError.fileTooShort
         }
         guard input[0] == 0x45, input[1] == 0x43, input[2] == 0x4D, input[3] == 0 else {
@@ -206,8 +239,10 @@ public final class ECMDecoder {
         }
 
         var offset = 4
+        // Decoded bytes are buffered here and handed to `sink` in chunks of about `flushSize`.
+        let flushSize = 4 << 20
         var output = [UInt8]()
-        output.reserveCapacity(total)
+        output.reserveCapacity(flushSize + 2352)
         var edc: ECCUInt32 = 0
         var lastReported = 0
         let reportInterval = 1 << 20
@@ -242,15 +277,26 @@ public final class ECMDecoder {
                 num |= Int(c & 0x7F) << bits
                 bits += 7
             }
-            guard num <= 0xFFFFFFFF else { throw ECMError.invalidCount }
+            num &= 0xFFFFFFFF // unecm.c keeps the count in a 32-bit unsigned
             if num == 0xFFFFFFFF { break }
             num += 1
+            guard num < 0x80000000 else { throw ECMError.invalidCount } // unecm.c: "Corrupt ECM file"
 
             if type == 0 {
                 guard num <= total - offset else { throw ECMError.truncatedData }
-                output.append(contentsOf: UnsafeBufferPointer(rebasing: input[offset..<(offset + num)]))
-                edc = eccedc.edcUpdate(edc, base + offset, count: num)
-                offset += num
+                var remaining = num
+                while remaining > 0 {
+                    let piece = min(remaining, flushSize)
+                    output.append(contentsOf: UnsafeBufferPointer(rebasing: input[offset..<(offset + piece)]))
+                    edc = eccedc.edcUpdate(edc, base + offset, count: piece)
+                    offset += piece
+                    remaining -= piece
+                    if output.count >= flushSize {
+                        try sink(output)
+                        output.removeAll(keepingCapacity: true)
+                    }
+                    try tick(force: false)
+                }
                 continue
             }
 
@@ -295,6 +341,10 @@ public final class ECMDecoder {
                     edc = eccedc.edcUpdate(edc, b.baseAddress! + start, count: end - start)
                 }
                 output.append(contentsOf: sector[start..<end])
+                if output.count >= flushSize {
+                    try sink(output)
+                    output.removeAll(keepingCapacity: true)
+                }
             }
         }
 
@@ -305,8 +355,9 @@ public final class ECMDecoder {
             | (ECCUInt32(input[offset + 2]) << 16)
             | (ECCUInt32(input[offset + 3]) << 24)
         guard stored == edc else { throw ECMError.checksumMismatch }
+        offset += 4
 
+        if !output.isEmpty { try sink(output) }
         try tick(force: true)
-        return Data(output)
     }
 }

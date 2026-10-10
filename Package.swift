@@ -3,7 +3,9 @@ import PackageDescription
 
 var targets: [Target] = [
     .target(name: "ECMCore"),
-    .testTarget(name: "ECMCoreTests", dependencies: ["ECMCore"]),
+    // Fixtures are read from disk via #filePath, so keep them out of the build
+    // (otherwise SwiftPM warns about unhandled .ecm/.bin files).
+    .testTarget(name: "ECMCoreTests", dependencies: ["ECMCore"], exclude: ["Fixtures"]),
 ]
 var products: [Product] = [
     .library(name: "ECMCore", targets: ["ECMCore"]),

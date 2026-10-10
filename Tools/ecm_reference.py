@@ -289,6 +289,8 @@ def decode(ecm):
         if num == 0xFFFFFFFF:
             break
         num += 1
+        if num >= 0x80000000:          # unecm.c: "goto corrupt"
+            raise InvalidCount("count too large")
         if type_ == 0:
             if pos + num > n:
                 raise TruncatedData("raw block truncated")

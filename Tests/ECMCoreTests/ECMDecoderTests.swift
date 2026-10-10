@@ -38,6 +38,27 @@ final class ECMDecoderTests: XCTestCase {
         return sector
     }
 
+    /// Type/count varint as written by ecm.c (stores count - 1).
+    private func typeCount(_ type: UInt8, _ count: Int) -> [UInt8] {
+        var n = count - 1
+        var bytes: [UInt8] = [UInt8((n & 0x1F) << 2) | type]
+        n >>= 5
+        while n > 0 {
+            bytes[bytes.count - 1] |= 0x80
+            bytes.append(UInt8(n & 0x7F))
+            n >>= 7
+        }
+        return bytes
+    }
+
+    private func le32(_ value: UInt32) -> [UInt8] {
+        return [UInt8(value & 0xFF), UInt8((value >> 8) & 0xFF),
+                UInt8((value >> 16) & 0xFF), UInt8((value >> 24) & 0xFF)]
+    }
+
+    private let magic: [UInt8] = [0x45, 0x43, 0x4D, 0x00]
+    private let endMarker: [UInt8] = [0xFC, 0xFF, 0xFF, 0xFF, 0x3F]
+
     // MARK: - Fixture round trips
 
     func testMixedFixtureRoundTrip() throws {
@@ -138,6 +159,34 @@ final class ECMDecoderTests: XCTestCase {
                 XCTAssertTrue(error is ECMError, "length \(length): \(error)")
             }
         }
+    }
+
+    func testMagicOnlyIsTruncated() throws {
+        assertDecodeThrows(Data(magic), .truncatedData)
+    }
+
+    func testCountAtUnecmLimitIsInvalid() throws {
+        // count - 1 = 0x7FFFFFFF -> count 0x80000000, which unecm.c rejects as corrupt
+        assertDecodeThrows(Data(magic + [0xFC, 0xFF, 0xFF, 0xFF, 0x1F] + [UInt8](repeating: 0x78, count: 10)),
+                           .invalidCount)
+        // one below the limit is just a raw block that runs past the end of the file
+        assertDecodeThrows(Data(magic + [0xF8, 0xFF, 0xFF, 0xFF, 0x1F] + [UInt8](repeating: 0x78, count: 10)),
+                           .truncatedData)
+    }
+
+    func testCountIsTruncatedTo32BitsLikeUnecm() throws {
+        // Bits above 32 are dropped, so this non-canonical spelling is still the end marker.
+        let bytes = magic + [0xFC, 0xFF, 0xFF, 0xFF, 0x7F] + le32(0)
+        XCTAssertEqual(try ECMDecoder().decode(data: Data(bytes)), Data())
+    }
+
+    func testLargeRawBlockSpansOutputChunks() throws {
+        // Bigger than the decoder's 4 MiB output chunk, so it is split and flushed in pieces.
+        let payload = (0..<(4_200_000 + 7)).map { UInt8(truncatingIfNeeded: $0 &* 31 &+ 7) }
+        let edc = payload.withUnsafeBufferPointer { ECCEDC().edcUpdate(0, $0.baseAddress!, count: $0.count) }
+        let bytes = magic + typeCount(0, payload.count) + payload + endMarker + le32(edc)
+        let output = try ECMDecoder().decode(data: Data(bytes))
+        XCTAssertEqual(output, Data(payload))
     }
 
     func testErrorsAreEquatable() {
@@ -249,6 +298,36 @@ final class ECMDecoderTests: XCTestCase {
                                                      cancelCheck: { false })) { error in
             XCTAssertEqual(error as? ECMError, .checksumMismatch)
         }
+    }
+
+    func testURLDecodeFailureLeavesNoFilesBehind() throws {
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ECMDecoderTests-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let outputURL = tempDir.appendingPathComponent("out.bin")
+        XCTAssertThrowsError(try ECMDecoder().decode(inputURL: fixtureURL("truncated.ecm"),
+                                                     outputURL: outputURL,
+                                                     progressHandler: { _ in },
+                                                     cancelCheck: { false }))
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: tempDir.path), [])
+    }
+
+    func testURLDecodeReplacesExistingOutput() throws {
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ECMDecoderTests-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let outputURL = tempDir.appendingPathComponent("out.bin")
+        try Data(repeating: 0xEE, count: 200_000).write(to: outputURL)
+        try ECMDecoder().decode(inputURL: fixtureURL("mode1.ecm"),
+                                outputURL: outputURL,
+                                progressHandler: { _ in },
+                                cancelCheck: { false })
+        XCTAssertEqual(try Data(contentsOf: outputURL), try fixture("mode1.bin"))
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: tempDir.path), ["out.bin"])
     }
 
     // MARK: - ECC / EDC regeneration

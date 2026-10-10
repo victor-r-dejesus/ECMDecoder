@@ -214,6 +214,20 @@ class ErrorTests(unittest.TestCase):
 
     def test_bad_count(self):
         with self.assertRaises(ref.InvalidCount): ref.decode(rd("badcount.ecm"))
+        # unecm.c rejects num + 1 >= 0x80000000 as corrupt ("FC FF FF FF 1F" = 0x7FFFFFFF)
+        with self.assertRaises(ref.InvalidCount):
+            ref.decode(ref.MAGIC + b"\xfc\xff\xff\xff\x1f" + b"x" * 10)
+        # one below the limit is a (truncated) raw block, not a count error
+        with self.assertRaises(ref.TruncatedData):
+            ref.decode(ref.MAGIC + b"\xf8\xff\xff\xff\x1f" + b"x" * 10)
+
+    def test_count_is_32_bit_like_unecm(self):
+        # High bits beyond 32 are dropped (unsigned arithmetic in unecm.c), so this
+        # non-canonical spelling is still the end marker.
+        self.assertEqual(ref.decode(ref.MAGIC + b"\xfc\xff\xff\xff\x7f\0\0\0\0"), b"")
+
+    def test_exactly_magic_is_truncated(self):
+        with self.assertRaises(ref.TruncatedData): ref.decode(ref.MAGIC)
 
     def test_checksum(self):
         with self.assertRaises(ref.ChecksumMismatch): ref.decode(rd("badchecksum.ecm"))
