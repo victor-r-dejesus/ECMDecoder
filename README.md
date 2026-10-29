@@ -13,6 +13,12 @@ ECM ("Error Code Modeler", by Neill Corlett) shrinks CD images by stripping the 
 - **Safe with existing files.** The image is written to a hidden temporary file and only moved into place when decoding succeeds. A failed or cancelled decode never overwrites an existing `.bin`.
 - **Handles large images.** Input is memory-mapped and output is streamed to disk, so a 700 MB CD image doesn't need to be held in memory.
 
+## Installing
+
+Download the latest `ECMDecoder-<version>.dmg` from the [Releases](https://github.com/victor-r-dejesus/ECMDecoder/releases) page, open it, and drag **ECMDecoder** to **Applications**. Requires macOS 12 or later, on Apple silicon or Intel.
+
+The app is not notarized, so macOS blocks the first launch. Right-click (or Control-click) ECMDecoder in Applications, choose **Open**, then confirm. On macOS 15 and later, go to **System Settings → Privacy & Security** and click **Open Anyway**.
+
 ## Usage
 
 1. Drag a `.ecm` file onto the drop area.
@@ -24,22 +30,41 @@ Output is named after the input with the `.ecm` (and any `.bin`) extension remov
 
 ## Building
 
-The repository contains the Swift sources only, without an Xcode project:
-
-| File | Purpose |
+| Path | Purpose |
 | --- | --- |
-| `ECMDecoderApp.swift` | App entry point |
-| `ContentView.swift` | SwiftUI window: drop area, buttons, progress, log, `.cue` creation |
-| `ECMDecoder.swift` | ECM format decoder, with ECC/EDC sector reconstruction |
+| `App/ECMDecoderApp.swift` | App entry point |
+| `App/ContentView.swift` | SwiftUI window: drop area, buttons, progress, log, `.cue` creation |
+| `Sources/ECMDecoderCore/ECMDecoder.swift` | ECM format decoder, with ECC/EDC sector reconstruction |
+| `Tests/ECMDecoderTests/` | Unit tests for the decoder, with a fixture made by the reference `ecm` tool |
+| `scripts/build-app.sh` | Builds the app and the DMG |
 
-To build:
+On a Mac with Xcode or the Command Line Tools installed:
 
-1. In Xcode, create a new **macOS → App** project named `ECMDecoder`, with the SwiftUI interface and the Swift language.
-2. Delete the template's generated `ContentView.swift` and `<Name>App.swift`, then add the three files above to the target.
-3. If the App Sandbox is enabled, set **User Selected File** to **Read/Write** under *Signing & Capabilities* so the app can read the dropped file and write to the chosen folder.
-4. Build and run.
+```bash
+swift test
+```
 
-The decoder (`ECMDecoder.swift`) uses only Foundation and typechecks under Swift 5 and Swift 6 language modes. The UI targets SwiftUI on macOS.
+```bash
+scripts/build-app.sh 1.0.0
+```
+
+The first command runs the decoder's unit tests. The second builds a universal `build/ECMDecoder.app` and packages it as `build/ECMDecoder-1.0.0.dmg`. The decoder only uses Foundation, so `swift test` also runs on Linux.
+
+To work on the app in Xcode instead, create a **macOS → App** project with the SwiftUI interface, delete the template's `ContentView.swift` and `<Name>App.swift`, and add the two files in `App/` plus `Sources/ECMDecoderCore/ECMDecoder.swift` to the app target.
+
+## Releasing
+
+Push a version tag. The [Release workflow](.github/workflows/release.yml) runs the tests, builds the DMG on a macOS runner, and publishes a GitHub release with the DMG attached:
+
+```bash
+git tag v1.0.0
+```
+
+```bash
+git push origin v1.0.0
+```
+
+Every push and pull request also runs the tests and builds the DMG through the [CI workflow](.github/workflows/ci.yml).
 
 ## Credits
 
