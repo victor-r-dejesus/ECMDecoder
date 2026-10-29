@@ -1,9 +1,16 @@
 name: Release
 
-# Push a tag like v1.0.0 to build the DMG and publish a GitHub release.
+# Push a tag like v1.0.0, or run this workflow by hand with a version, to
+# build the DMG and publish a GitHub release. Run by hand, it creates the tag
+# on the commit it runs from.
 on:
   push:
     tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release, without the v (for example 1.1.0)'
+        required: true
 
 permissions:
   contents: write
@@ -11,6 +18,8 @@ permissions:
 jobs:
   release:
     runs-on: macos-15
+    env:
+      TAG: ${{ github.event_name == 'workflow_dispatch' && format('v{0}', inputs.version) || github.ref_name }}
     steps:
       - uses: actions/checkout@v4
 
@@ -18,14 +27,14 @@ jobs:
         run: swift test
 
       - name: Build app and DMG
-        run: scripts/build-app.sh "${GITHUB_REF_NAME#v}"
+        run: scripts/build-app.sh "${TAG#v}"
 
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" build/*.dmg \
-            --title "ECMDecoder ${GITHUB_REF_NAME#v}" \
+          gh release create "$TAG" build/*.dmg --target "$GITHUB_SHA" \
+            --title "ECMDecoder ${TAG#v}" \
             --generate-notes \
             --notes "Download the DMG, open it and drag ECMDecoder to Applications. Requires macOS 12 or later (Apple silicon or Intel).
 
