@@ -64,6 +64,8 @@ git tag v1.0.0
 git push origin v1.0.0
 ```
 
+You can also start a release without a local tag: on GitHub, open **Actions → Release → Run workflow**, enter the version (for example `1.1.0`), and the workflow creates the `v1.1.0` tag on that commit.
+
 Every push and pull request also runs the tests and builds the DMG through the [CI workflow](.github/workflows/ci.yml).
 
 ## Credits
